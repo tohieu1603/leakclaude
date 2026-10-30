@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local environment + secrets
+.env
+.env.local
+
+# Persisted sessions are user data, never commit
+# (only relevant if SESSIONS_DIR points inside the repo)
+.agentmini-nest/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Reports — keep the source content_*.py, regenerate the .docx
+docs/*.docx
+
+# Logs
+*.log

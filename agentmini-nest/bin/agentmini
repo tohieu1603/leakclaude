@@ -1,0 +1,244 @@
+#!/usr/bin/env node
+/* eslint-disable */
+// agentmini CLI — wrapper around POST /api/chat that:
+//   1. auto-tracks the last sessionId in ~/.agentmini-nest/.last-session,
+//      so consecutive calls share conversation history (the UX gap that made
+//      "thêm 5 dòng" hit a fresh session previously).
+//   2. parses the SSE stream and pretty-prints text, tool calls, and errors.
+//
+// Usage:
+//   agentmini "your message"           — continues last session
+//   agentmini -n "fresh start"          — starts a new session
+//   agentmini -s <uuid> "msg"           — continues a specific session
+//   agentmini --list                    — list saved sessions
+//   agentmini --stats                   — server stats
+//   agentmini --url http://host:port    — override base URL (default 3000)
+
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { URL } = require('url');
+
+const STATE_DIR = path.join(os.homedir(), '.agentmini-nest');
+const STATE_FILE = path.join(STATE_DIR, '.last-session');
+const DEFAULT_BASE = process.env.AGENTMINI_URL || 'http://localhost:3000';
+
+// ANSI colors (no chalk dep). Disable when piping (TTY check).
+const isTty = process.stdout.isTTY;
+const c = (code, s) => (isTty ? `\x1b[${code}m${s}\x1b[0m` : s);
+const dim = (s) => c('2', s);
+const cyan = (s) => c('36', s);
+const green = (s) => c('32', s);
+const yellow = (s) => c('33', s);
+const red = (s) => c('31', s);
+const bold = (s) => c('1', s);
+
+function readLastSession() {
+  try {
+    return fs.readFileSync(STATE_FILE, 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLastSession(id) {
+  try {
+    if (!fs.existsSync(STATE_DIR)) fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, id);
+  } catch (e) {
+    process.stderr.write(red(`[warn] failed to persist session id: ${e.message}\n`));
+  }
+}
+
+function parseArgs(argv) {
+  const opts = { fresh: false, sessionId: null, url: DEFAULT_BASE, command: null };
+  const rest = [];
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-n' || a === '--new') opts.fresh = true;
+    else if (a === '-s' || a === '--session') opts.sessionId = argv[++i];
+    else if (a === '--url') opts.url = argv[++i];
+    else if (a === '--list') opts.command = 'list';
+    else if (a === '--stats') opts.command = 'stats';
+    else if (a === '--help' || a === '-h') opts.command = 'help';
+    else rest.push(a);
+  }
+  opts.message = rest.join(' ');
+  return opts;
+}
+
+function helpText() {
+  return `agentmini — chat with the local AgentMini-Nest server
+
+usage:
+  agentmini "your message"           continue last session (or start fresh if none)
+  agentmini -n "fresh start"          force a new session
+  agentmini -s <uuid> "msg"           continue a specific session
+  agentmini --list                    list saved sessions on disk
+  agentmini --stats                   server stats (active/persisted/tools/commands)
+  agentmini --url <base>              override base URL (default ${DEFAULT_BASE})
+  agentmini --help                    this help
+
+env:
+  AGENTMINI_URL  default base URL (overrides 3000)
+  AGENTMINI_KEY  API key sent as X-API-Key (when the server has API_KEYS set)
+
+state:
+  ${STATE_FILE} keeps the latest sessionId so consecutive calls share history.
+`;
+}
+
+function authHeaders() {
+  const key = process.env.AGENTMINI_KEY;
+  return key ? { 'X-API-Key': key } : {};
+}
+
+function request(method, baseUrl, pathName, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(pathName, baseUrl);
+    const lib = u.protocol === 'https:' ? https : http;
+    const headers = { ...authHeaders() };
+    if (body) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(body);
+    }
+    const req = lib.request(
+      {
+        method,
+        hostname: u.hostname,
+        port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + (u.search || ''),
+        headers,
+      },
+      (res) => resolve(res),
+    );
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function fetchJson(method, baseUrl, pathName, body) {
+  const res = await request(method, baseUrl, pathName, body);
+  let buf = '';
+  res.setEncoding('utf8');
+  for await (const chunk of res) buf += chunk;
+  if (res.statusCode >= 400) throw new Error(`HTTP ${res.statusCode}: ${buf}`);
+  return JSON.parse(buf);
+}
+
+async function streamChat(baseUrl, message, sessionId) {
+  const body = JSON.stringify({ message, ...(sessionId ? { sessionId } : {}) });
+  const res = await request('POST', baseUrl, '/api/chat', body);
+  if (res.statusCode >= 400) {
+    let buf = '';
+    res.setEncoding('utf8');
+    for await (const chunk of res) buf += chunk;
+    throw new Error(`HTTP ${res.statusCode}: ${buf}`);
+  }
+  res.setEncoding('utf8');
+
+  let acc = '';
+  let finalSessionId = null;
+  let totalIn = 0;
+  let totalOut = 0;
+  let turns = 0;
+  let printedHeader = false;
+
+  for await (const chunk of res) {
+    acc += chunk;
+    // SSE frames are separated by blank lines; "data: <json>\n\n"
+    let idx;
+    while ((idx = acc.indexOf('\n\n')) !== -1) {
+      const frame = acc.slice(0, idx);
+      acc = acc.slice(idx + 2);
+      const line = frame.trim().replace(/^data:\s*/, '');
+      if (!line) continue;
+      let evt;
+      try {
+        evt = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!printedHeader && evt.type === 'session_id') {
+        finalSessionId = evt.sessionId;
+        process.stdout.write(dim(`[session ${evt.sessionId}]\n`));
+        printedHeader = true;
+        continue;
+      }
+      switch (evt.type) {
+        case 'text_delta':
+          process.stdout.write(evt.text);
+          break;
+        case 'tool_start':
+          process.stdout.write(
+            `\n${cyan('▶')} ${bold(evt.toolName)} ${dim(JSON.stringify(evt.input).slice(0, 200))}\n`,
+          );
+          break;
+        case 'tool_result': {
+          const colour = evt.isError ? red : green;
+          const sym = evt.isError ? '✗' : '✓';
+          const preview = evt.content.length > 600 ? evt.content.slice(0, 600) + '…' : evt.content;
+          process.stdout.write(`${colour(sym)} ${dim(preview)}\n`);
+          break;
+        }
+        case 'turn_error':
+          process.stdout.write(`\n${yellow('⚠ turn_error:')} ${evt.message}\n`);
+          break;
+        case 'error':
+          process.stdout.write(`\n${red('✗ error:')} ${evt.message}\n`);
+          break;
+        case 'done':
+          totalIn = evt.inputTokens;
+          totalOut = evt.outputTokens;
+          turns = evt.turns;
+          break;
+      }
+    }
+  }
+  process.stdout.write(
+    `\n\n${dim(`[turns=${turns} in=${totalIn} out=${totalOut}]`)}\n`,
+  );
+  return finalSessionId;
+}
+
+async function main() {
+  const opts = parseArgs(process.argv);
+  if (opts.command === 'help' || (!opts.command && !opts.message)) {
+    process.stdout.write(helpText());
+    return;
+  }
+  if (opts.command === 'stats') {
+    const stats = await fetchJson('GET', opts.url, '/api/chat/stats');
+    process.stdout.write(JSON.stringify(stats, null, 2) + '\n');
+    return;
+  }
+  if (opts.command === 'list') {
+    const data = await fetchJson('GET', opts.url, '/api/chat/sessions');
+    if (!data.sessions || data.sessions.length === 0) {
+      process.stdout.write('(no saved sessions)\n');
+      return;
+    }
+    for (const s of data.sessions.slice(0, 30)) {
+      process.stdout.write(
+        `${cyan(s.sessionId)}  msgs=${s.messageCount}  in=${s.cumulativeInputTokens} out=${s.cumulativeOutputTokens}  ${dim(s.lastActiveAt)}\n`,
+      );
+    }
+    return;
+  }
+
+  // Resolve sessionId: explicit -s wins, else --new ignores last, else use last
+  let sessionId = null;
+  if (opts.sessionId) sessionId = opts.sessionId;
+  else if (!opts.fresh) sessionId = readLastSession();
+
+  const newId = await streamChat(opts.url, opts.message, sessionId);
+  if (newId) writeLastSession(newId);
+}
+
+main().catch((e) => {
+  process.stderr.write(red(`error: ${e.message}\n`));
+  process.exit(1);
+});
